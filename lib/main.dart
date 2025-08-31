@@ -1,7 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:path/path.dart';
 import 'package:sqflite/sqflite.dart';
+import 'package:flutter/services.dart';
+import 'package:share_plus/share_plus.dart';
 import 'dart:async';
+import 'dart:io';
 
 void main() {
   runApp(const MyApp());
@@ -29,15 +32,21 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Database? _db;
-  int todayCount = 0;
-  int tonightCount = 0;
-  Map<String, List<int>> dayTimestamps = {};
+  List<Map<String, dynamic>> daysList = []; // Liste de jours pour ordre inversé
+  static const platform = MethodChannel('quick_tile_channel');
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _initDb();
+
+    // Quick Tile callback
+    platform.setMethodCallHandler((call) async {
+      if (call.method == "addEvent") {
+        await addEvent();
+      }
+    });
   }
 
   @override
@@ -73,84 +82,101 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _refreshCounts() async {
-    final now = DateTime.now();
+    if (_db == null) return;
 
-    // Total du jour 08:00 → 08:00
-    final startOfDay = DateTime(now.year, now.month, now.day, 8);
-    final startMs = startOfDay.millisecondsSinceEpoch;
-    final endMs = startOfDay.add(const Duration(days: 1)).millisecondsSinceEpoch;
+    final res = await _db!.query('events', orderBy: 'timestamp DESC');
+    Map<String, Map<String, dynamic>> tempMap = {};
 
-    final todayRes = await _db?.rawQuery(
-      'SELECT COUNT(*) as c FROM events WHERE timestamp BETWEEN ? AND ?',
-      [startMs, endMs],
-    );
-    todayCount = todayRes?[0]['c'] as int? ?? 0;
+    for (var row in res) {
+      final ts = row['timestamp'] as int;
+      final dt = DateTime.fromMillisecondsSinceEpoch(ts);
 
-    // Nuit 22:00 → 08:00
-    final startNight = DateTime(now.year, now.month, now.day, 22).subtract(const Duration(days: 1));
-    final endNight = DateTime(now.year, now.month, now.day, 8);
-    final nightRes = await _db?.rawQuery(
-      'SELECT COUNT(*) as c FROM events WHERE timestamp BETWEEN ? AND ?',
-      [startNight.millisecondsSinceEpoch, endNight.millisecondsSinceEpoch],
-    );
-    tonightCount = nightRes?[0]['c'] as int? ?? 0;
+      // Définir "jour" 8h → 8h
+      DateTime dayStart = DateTime(dt.year, dt.month, dt.day, 8);
+      if (dt.isBefore(dayStart)) {
+        dayStart = dayStart.subtract(const Duration(days: 1));
+      }
+      final dayKey = dayStart.toIso8601String().substring(0, 10);
 
-    // Regrouper par journée 08:00 → 08:00
-    final res = await _db?.rawQuery(
-      'SELECT timestamp FROM events ORDER BY timestamp DESC',
-    );
-    dayTimestamps = {};
-    if (res != null) {
-      for (var row in res) {
-        final ts = row['timestamp'] as int;
-        final dt = DateTime.fromMillisecondsSinceEpoch(ts);
-        // Calculer date de la journée 08:00→08:00
-        DateTime day;
-        if (dt.hour >= 8) {
-          day = DateTime(dt.year, dt.month, dt.day, 8);
-        } else {
-          final prev = dt.subtract(const Duration(days: 1));
-          day = DateTime(prev.year, prev.month, prev.day, 8);
-        }
-        final dayKey = day.toIso8601String().substring(0, 10);
-        dayTimestamps.putIfAbsent(dayKey, () => []).add(ts);
+      tempMap.putIfAbsent(dayKey, () => {'total': 0, 'night': 0, 'timestamps': <DateTime>[]});
+      tempMap[dayKey]!['total'] += 1;
+      tempMap[dayKey]!['timestamps'].add(dt);
+
+      // Comptage nuit 22h → 8h
+      final nightStart = DateTime(dt.year, dt.month, dt.day, 22);
+      final nightEnd = nightStart.add(const Duration(hours: 10));
+      if (dt.isAfter(nightStart) || dt.isBefore(nightStart.subtract(const Duration(hours: 14)))) {
+        tempMap[dayKey]!['night'] += 1;
       }
     }
 
-    setState(() {});
+    // Convertir map en liste pour contrôler l'ordre
+    List<Map<String, dynamic>> tempList = tempMap.entries.map((e) {
+      List<DateTime> times = List<DateTime>.from(e.value['timestamps']);
+      times.sort((b, a) => a.compareTo(b)); // heures inverse
+      return {'day': e.key, 'total': e.value['total'], 'night': e.value['night'], 'timestamps': times};
+    }).toList();
+
+    // Trier les jours en ordre inversé
+    tempList.sort((b, a) => a['day'].compareTo(b['day']));
+
+    setState(() {
+      daysList = tempList;
+    });
   }
 
-  String formatTimestamp(int ts) {
-    final dt = DateTime.fromMillisecondsSinceEpoch(ts);
-    return "${dt.hour.toString().padLeft(2,'0')}:${dt.minute.toString().padLeft(2,'0')}:${dt.second.toString().padLeft(2,'0')}";
+  Future<void> exportJsonl() async {
+    if (_db == null) return;
+
+    final res = await _db!.query('events', orderBy: 'timestamp ASC');
+
+    final dir = await Directory.systemTemp.createTemp();
+    final file = File('${dir.path}/toilet_events.jsonl');
+    final sink = file.openWrite();
+
+    for (var row in res) {
+      sink.writeln('{"id": ${row['id']}, "timestamp": ${row['timestamp']}}');
+    }
+    await sink.flush();
+    await sink.close();
+
+    await Share.shareXFiles([XFile(file.path)], text: 'Export Toilet Tracker Events');
   }
+
+  String formatTime(DateTime dt) => "${dt.hour.toString().padLeft(2,'0')}:${dt.minute.toString().padLeft(2,'0')}:${dt.second.toString().padLeft(2,'0')}";
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Toilet Tracker')),
+      appBar: AppBar(
+        title: const Text('Toilet Tracker'),
+        actions: [
+          TextButton(
+            onPressed: exportJsonl,
+            child: const Text(
+              'Exporter',
+              style: TextStyle(color: Colors.black), // visible sur fond bleu
+            ),
+          ),
+        ],
+      ),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: ListView(
-          children: dayTimestamps.entries.map((entry) {
-            final day = entry.key;
-            final timestamps = entry.value;
-            final totalDay = timestamps.length;
-            final totalNight = timestamps
-                .where((ts) {
-                  final dt = DateTime.fromMillisecondsSinceEpoch(ts);
-                  return dt.hour >= 22 || dt.hour < 8;
-                })
-                .length;
+          children: daysList.map((entry) {
+            final day = entry['day'];
+            final total = entry['total'];
+            final night = entry['night'];
+            final timestamps = entry['timestamps'] as List<DateTime>;
             return Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(day, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
                 const Divider(),
-                Text("Total jour (08:00→08:00): $totalDay"),
-                Text("Total nuit (22:00→08:00): $totalNight"),
-                ...timestamps.map((ts) => Text(formatTimestamp(ts))).toList(),
-                const SizedBox(height: 20),
+                Text(day, style: const TextStyle(fontWeight: FontWeight.bold)),
+                Text('Total journée (8h-8h): $total'),
+                Text('Total nuit (22h-8h): $night'),
+                ...timestamps.map((ts) => Text(formatTime(ts))).toList(),
+                const SizedBox(height: 8),
               ],
             );
           }).toList(),

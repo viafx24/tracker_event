@@ -33,7 +33,8 @@ dependencies:
   sqflite: any
   path: any
   cupertino_icons: ^1.0.8
-
+  path_provider: ^2.0.17    # pour accéder au stockage local
+  share_plus: ^11.1.0
 dev_dependencies:
   flutter_test:
     sdk: flutter
